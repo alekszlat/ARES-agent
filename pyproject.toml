@@ -1,0 +1,9 @@
+[project]
+name = "ARES-agent"
+version = "0.1.0"
+description = "Introduction to AI agent"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "requests>=2.32.5",
+]
