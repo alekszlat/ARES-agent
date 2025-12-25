@@ -9,5 +9,6 @@ dependencies = [
     "mcp[cli]>=1.23.0",
     "pydantic>=2.12.5",
     "requests>=2.32.5",
+    "selenium",
     "streamlit>=1.51.0",
 ]

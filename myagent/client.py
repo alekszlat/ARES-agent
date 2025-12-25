@@ -10,6 +10,7 @@ simple async API the rest of the agent can use.
 """
 import os
 import asyncio
+import logging
 from contextlib import AsyncExitStack
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -65,16 +66,17 @@ class MCPClient:
         """
 
         abs_path = os.path.abspath(server_script_path)
-        print("Starting MCP server at:", abs_path)
-        print("Exists?", os.path.exists(abs_path))
 
+        logging.debug(f"Starting MCP server at: {abs_path}")
+        logging.debug(f"Exists? {os.path.exists(abs_path)}")
+        
         if not os.path.exists(abs_path):
             raise FileNotFoundError(f"MCP server script not found: {abs_path}")
 
         server_params = StdioServerParameters(
             command="python",
             args=[abs_path],
-            env=None,
+            env=os.environ.copy(),
         )
 
         # Spawn a subprocess running the MCP server over stdio.
@@ -282,15 +284,19 @@ async def test():
         await client.connect_to_server(path)
 
         tools = await client.list_tools()
-        print("Tools:", [t.name for t in tools])
+        logging.debug(f"Tools: {[t.name for t in tools]}")
 
         # Call echo_tool
         ok, content = await client.call_tool("echo_tool", {"text": "Hello MCP"})
-        print("echo_tool ->", ok, [c.text for c in content])
+        logging.debug(f"echo_tool content: {[c.text for c in content]}")
 
         # Call reverse_tool
         ok, content = await client.call_tool("reverse_tool", {"text": "Hello MCP"})
-        print("reverse_tool ->", ok, [c.text for c in content])
+        logging.debug("reverse_tool ->", ok, [c.text for c in content])
+
+        # Call youtube tool
+        ok, content = await client.call_tool("open_youtube_search", {"text": "Hello MCP"})
+        logging.debug("open_youtube_search ->", ok, [c.text for c in content])
 
     finally:
         await client.cleanup()
