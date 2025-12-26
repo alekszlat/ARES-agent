@@ -2,19 +2,9 @@ import re
 import time
 import requests
 import sys
+import webbrowser as web
 
 from urllib.parse import quote_plus
-
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.common.exceptions import TimeoutException , StaleElementReferenceException
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.firefox.service import Service
-
-
-
 
 
 def play_youtube_video(topic: str, timeout: int = 15) -> str:
@@ -38,32 +28,12 @@ def play_youtube_video(topic: str, timeout: int = 15) -> str:
     ### --------------------------------------------------------------------
 
 
-    driver = webdriver.Firefox(service=Service(log_output=sys.stderr))
     try:
-        driver.get(watch_url)
-
-        try:
-            btn = WebDriverWait(driver, timeout).until(
-                EC.element_to_be_clickable(
-                    (By.XPATH, "//button[.//span[normalize-space()='Accept all']]")
-                )
-            )
-            btn.click()
-        except TimeoutException:
-            # Consent dialog didn't show up
-            pass
-        
-        time.sleep(2)  # Wait for page to stabilize
-
-        body = WebDriverWait(driver, timeout).until(
-            EC.presence_of_element_located((By.TAG_NAME, "body"))
-        )
-        body.send_keys("k")
-        body.send_keys("k")
-
+        web.open(watch_url, new=2)
         return watch_url
     except Exception as e:
-        raise e
+        print(f"Error opening YouTube video: {e}", file=sys.stderr)
+        return ""
 
 
 if __name__ == "__main__":

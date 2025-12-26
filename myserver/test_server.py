@@ -6,24 +6,17 @@ Exposes a couple of trivial tools for testing the MCPClient:
 - open_youtube_search(topic): returns a YouTube search URL for the given topic and attempts to open it in the default web browser.
 """
 
-from itertools import count
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.server import logger
 
 from urllib.parse import quote_plus
 
 import requests
-import sys
-import time
 import re
 import anyio
 import os
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException
-from selenium.webdriver.firefox.service import Service
+
+import webbrowser as web
 
 class TestServer:
     def __init__(self) -> None:
@@ -49,13 +42,13 @@ class TestServer:
             return await anyio.to_thread.run_sync(_play_youtube_video_sync, topic)
 
 
-        def _play_youtube_video_sync(topic: str, timeout: int = 15) -> str:
+        def _play_youtube_video_sync(topic: str, tout: int = 10) -> str:
             ### --------------------------------------------------------------------
             query = quote_plus(topic)
             search_url = f"https://www.youtube.com/results?search_query={query}"
 
             headers = {"User-Agent": "Mozilla/5.0"}
-            resp = requests.get(search_url, headers=headers, timeout=10)
+            resp = requests.get(search_url, headers=headers, timeout=tout)
             resp.raise_for_status()
 
             # Find first watch URL
@@ -68,33 +61,12 @@ class TestServer:
 
             ### --------------------------------------------------------------------
 
-            services=Service(log_output=sys.stderr)
-            driver = webdriver.Firefox(service=services)
             try:
-                driver.get(watch_url)
-
-                try:
-                    btn = WebDriverWait(driver, timeout).until(
-                        EC.element_to_be_clickable(
-                            (By.XPATH, "//button[.//span[normalize-space()='Accept all']]")
-                        )
-                    )
-                    btn.click()
-                except TimeoutException:
-                    # Consent dialog didn't show up
-                    pass
-                
-                time.sleep(2)  # Wait for page to stabilize
-
-                body = WebDriverWait(driver, timeout).until(
-                    EC.presence_of_element_located((By.TAG_NAME, "body"))
-                )
-                body.send_keys("k")
-                body.send_keys("k")
-
+                web.open(watch_url, new=2)
                 return watch_url
             except Exception as e:
-                raise e
+                logger.error(f"Error opening YouTube video: {e}")
+                return ""
 
     def run(self) -> None:
         """Run the MCP server over stdio."""
