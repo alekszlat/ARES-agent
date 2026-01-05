@@ -1,141 +1,253 @@
-import datetime as _dt
-import shutil
-import subprocess
-import psutil
+# app/main.py
+import sys
+import asyncio
+from typing import Optional
 
-CPU_HINTS = ("package", "tctl", "tdie", "cpu", "core")
-GPU_QUERY = "name,utilization.gpu,temperature.gpu,memory.total,memory.used,memory.free"
+from PySide6.QtCore import QObject, Signal, Slot, QThread
+from PySide6.QtWidgets import (
+    QApplication,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QPushButton,
+    QPlainTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
 
-def get_cpu_temp_c() -> float | None:
-    """Best-effort CPU temperature in °C, or None if unavailable."""
-    temps = psutil.sensors_temperatures(fahrenheit=False)
-    if not temps:
-        return None
-
-    fallback: float | None = None
-
-    for sensor_name, entries in temps.items():
-        sname = (sensor_name or "").lower()
-        for e in entries:
-            cur = getattr(e, "current", None)
-            if cur is None:
-                continue
-
-            label = (getattr(e, "label", "") or "").lower()
-            cpuish = any(h in label for h in CPU_HINTS) or any(h in sname for h in CPU_HINTS)
-
-            # Prefer CPU-ish readings immediately
-            if cpuish and 0 < cur < 130:
-                return float(cur)
-
-            # Keep a reasonable fallback (in case nothing matches CPU hints)
-            if fallback is None and 0 < cur < 130:
-                fallback = float(cur)
-
-    return fallback
+# --- your existing backend imports ---
+from myagent import Agent, LlamaCPP, LlamaPrompt
+from agentio import PiperConfig, PiperTTS
 
 
-def get_nvidia_gpus(timeout_s: int = 2) -> tuple[list[dict], str | None]:
-    """
-    Returns (gpus, error). gpus is a list of dicts; empty list if unavailable.
-    """
-    if shutil.which("nvidia-smi") is None:
-        return [], "nvidia-smi not found"
+# -----------------------------
+# Background thread that owns an asyncio loop + the Agent
+# -----------------------------
+class AgentBackend(QThread):
+    # Signals emitted to the UI thread
+    state_changed = Signal(str)            # "idle" | "thinking" | "speaking" | "error"
+    assistant_text = Signal(str)           # final assistant text
+    tool_event = Signal(str)               # tool-calling / tool-result text
+    error = Signal(str)                    # error message
 
-    cmd = [
-        "nvidia-smi",
-        f"--query-gpu={GPU_QUERY}",
-        "--format=csv,noheader,nounits",
-    ]
+    def __init__(self, parent: Optional[QObject] = None) -> None:
+        super().__init__(parent)
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._agent: Optional[Agent] = None
+        self._tts: Optional[PiperTTS] = None
+        self._shutdown_fut: Optional[asyncio.Future] = None
 
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
-    except Exception as e:
-        return [], f"nvidia-smi failed to run: {e}"
+    def run(self) -> None:
+        """Qt calls this in a separate OS thread."""
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
 
-    if r.returncode != 0:
-        err = (r.stderr or "").strip() or "unknown nvidia-smi error"
-        return [], f"nvidia-smi returned {r.returncode}: {err}"
+        async def _startup() -> None:
+            # Create and initialize your agent + TTS inside the backend thread
+            model = LlamaCPP.from_path("./models/llama-3.2-3b-instruct-q4_k_m.gguf")
+            prompt = LlamaPrompt()
+            self._agent = Agent(name="Helper", model=model, prompt=prompt)
 
-    gpus: list[dict] = []
-    for line in (r.stdout or "").strip().splitlines():
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) != 6:
-            continue
+            # register MCP tools (server path as in your CLI script)
+            self._agent.register_mcp(path="./run_server.py")
 
-        name, util, temp, mem_total, mem_used, mem_free = parts
+            self._tts = PiperTTS(PiperConfig(model_path="./models/en_GB-northern_english_male-medium.onnx"))
 
-        def to_float(x: str) -> float | None:
+            # Keep the agent context open for the lifetime of the app
+            await self._agent.__aenter__()
+
+            self.state_changed.emit("idle")
+
+        async def _shutdown() -> None:
             try:
-                return float(x)
+                if self._agent is not None:
+                    await self._agent.__aexit__(None, None, None)
+            finally:
+                self.state_changed.emit("idle")
+                # Stop the event loop from inside itself
+                self._loop.stop()
+
+        # start up
+        try:
+            self._loop.run_until_complete(_startup())
+        except Exception as e:
+            self.error.emit(f"Backend startup failed: {e}")
+            return
+
+        # keep references so UI can ask us to stop
+        self._shutdown_fut = asyncio.ensure_future(asyncio.sleep(10**9), loop=self._loop)  # placeholder
+
+        # run event loop until stopped
+        try:
+            self._loop.run_forever()
+        finally:
+            # cleanup loop
+            pending = asyncio.all_tasks(loop=self._loop)
+            for t in pending:
+                t.cancel()
+            try:
+                self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
             except Exception:
-                return None
+                pass
+            self._loop.close()
 
-        gpus.append(
-            {
-                "name": name,
-                "utilization_percent": to_float(util),
-                "temperature_c": to_float(temp),
-                "memory_total_mb": to_float(mem_total),
-                "memory_used_mb": to_float(mem_used),
-                "memory_free_mb": to_float(mem_free),
-            }
-        )
+    def submit_user_message(self, text: str) -> None:
+        """Called from UI thread. Schedules work on the backend asyncio loop."""
+        if not self._loop or not self._agent:
+            self.error.emit("Backend not ready yet.")
+            return
 
-    return gpus, None
+        asyncio.run_coroutine_threadsafe(self._handle_message(text), self._loop)
 
-def get_system_info(timeout: int = 2) -> dict:
-    """
-    Return a structured snapshot of CPU/memory/disk + best-effort NVIDIA GPU stats.
-    Never crashes just because a metric is missing.
-    """
-    errors: list[str] = []
+    async def _handle_message(self, text: str) -> None:
+        try:
+            self.state_changed.emit("thinking")
 
-    # CPU
-    cpu_usage = psutil.cpu_percent(interval=0.2)  # small delay for a meaningful reading
-    cpu_temp = get_cpu_temp_c()
-    if cpu_temp is None:
-        errors.append("cpu_temp_unavailable")
+            # Call the agent
+            response_parts = await self._agent.chat(text)
 
-    # Memory
-    mem = psutil.virtual_memory()
+            final_text_chunks: list[str] = []
 
-    # Disk (root partition as a simple default)
-    disk = psutil.disk_usage("/")
+            for r in response_parts:
+                if getattr(r, "type", None) == "text":
+                    final_text_chunks.append(str(getattr(r, "data", "")))
+                elif getattr(r, "type", None) == "tool-calling":
+                    self.tool_event.emit(f"tool calling: {getattr(r, 'data', '')}")
+                elif getattr(r, "type", None) == "tool-result":
+                    self.tool_event.emit(f"tool result: {getattr(r, 'data', '')}")
 
-    # GPU (NVIDIA only, behind detection)
-    gpus, gpu_err = get_nvidia_gpus(timeout_s=timeout)
-    if gpu_err:
-        errors.append(f"gpu_unavailable: {gpu_err}")
+            final_text = "\n".join([t for t in final_text_chunks if t.strip()]) or "(no text response)"
+            self.assistant_text.emit(final_text)
 
-    return {
-        "timestamp": _dt.datetime.now().isoformat(timespec="seconds"),
-        "cpu": {
-            "usage_percent": cpu_usage,
-            "temperature_c": cpu_temp,
-        },
-        "memory": {
-            "total_gb": mem.total / (1024**3),
-            "used_gb": mem.used / (1024**3),
-            "available_gb": mem.available / (1024**3),
-            "used_percent": mem.percent,
-        },
-        "disk": {
-            "mount": "/",
-            "total_gb": disk.total / (1024**3),
-            "used_gb": disk.used / (1024**3),
-            "free_gb": disk.free / (1024**3),
-            "used_percent": disk.percent,
-        },
-        "gpu": {
-            "backend": "nvidia-smi",
-            "gpus": gpus,  # 0/1/many
-        },
-        "errors": errors,  # optional, but super useful for debugging + “best effort”
-    }
+            # Speak (run blocking TTS in a thread executor so asyncio loop stays responsive)
+            if self._tts is not None and final_text.strip():
+                self.state_changed.emit("speaking")
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, self._tts.speak, final_text)
+
+            self.state_changed.emit("idle")
+
+        except Exception as e:
+            self.state_changed.emit("error")
+            self.error.emit(str(e))
+            self.state_changed.emit("idle")
+
+    def shutdown(self) -> None:
+        """Called from UI thread on app exit."""
+        if not self._loop:
+            return
+        asyncio.run_coroutine_threadsafe(self._shutdown_async(), self._loop)
+
+    async def _shutdown_async(self) -> None:
+        try:
+            if self._agent is not None:
+                await self._agent.__aexit__(None, None, None)
+        finally:
+            # stop the loop
+            asyncio.get_running_loop().stop()
+
+
+# -----------------------------
+# Qt Widgets UI
+# -----------------------------
+class MainWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("ARES Agent")
+
+        self.output = QPlainTextEdit()
+        self.output.setReadOnly(True)
+
+        self.status = QLabel("Idle")
+
+        self.input = QLineEdit()
+        self.input.setPlaceholderText("Type a message...")
+        self.input.returnPressed.connect(self.on_send_clicked)
+
+        self.send_btn = QPushButton("Send")
+        self.send_btn.clicked.connect(self.on_send_clicked)
+
+        bottom = QHBoxLayout()
+        bottom.addWidget(self.input)
+        bottom.addWidget(self.send_btn)
+
+        layout = QVBoxLayout()
+        layout.addWidget(self.output)
+        layout.addWidget(self.status)
+        layout.addLayout(bottom)
+
+        container = QWidget()
+        container.setLayout(layout)
+        self.setCentralWidget(container)
+
+        # Start backend thread
+        self.backend = AgentBackend()
+        self.backend.state_changed.connect(self.on_state_changed)
+        self.backend.assistant_text.connect(self.on_assistant_text)
+        self.backend.tool_event.connect(self.on_tool_event)
+        self.backend.error.connect(self.on_error)
+        self.backend.start()
+
+    @Slot()
+    def on_send_clicked(self) -> None:
+        text = self.input.text().strip()
+        if not text:
+            return
+
+        self.append_line(f"You: {text}")
+        self.input.clear()
+
+        # Disable UI while backend works
+        self.set_busy(True)
+        self.backend.submit_user_message(text)
+
+    @Slot(str)
+    def on_state_changed(self, state: str) -> None:
+        pretty = {
+            "idle": "Idle",
+            "thinking": "Thinking…",
+            "speaking": "Speaking…",
+            "error": "Error",
+        }.get(state, state)
+
+        self.status.setText(pretty)
+
+        # Re-enable UI when we're idle (you can refine this later)
+        if state == "idle":
+            self.set_busy(False)
+
+    @Slot(str)
+    def on_assistant_text(self, text: str) -> None:
+        self.append_line(f"Assistant: {text}")
+
+    @Slot(str)
+    def on_tool_event(self, text: str) -> None:
+        self.append_line(f"[tool] {text}")
+
+    @Slot(str)
+    def on_error(self, msg: str) -> None:
+        self.append_line(f"[error] {msg}")
+
+    def set_busy(self, busy: bool) -> None:
+        self.input.setEnabled(not busy)
+        self.send_btn.setEnabled(not busy)
+
+    def append_line(self, line: str) -> None:
+        self.output.appendPlainText(line)
+
+
+def main() -> None:
+    app = QApplication(sys.argv)
+    win = MainWindow()
+    win.resize(700, 500)
+    win.show()
+
+    # Clean shutdown
+    app.aboutToQuit.connect(win.backend.shutdown)
+
+    sys.exit(app.exec())
+
 
 if __name__ == "__main__":
-    info = get_system_info()
-    import pprint
-
-    pprint.pprint(info)
+    main()
