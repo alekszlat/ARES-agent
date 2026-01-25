@@ -9,9 +9,6 @@ wheels/
 # Virtual environments
 .venv
 
-# Notes
-notes.md
-
 # Models
 models/llama-3.2-3b-instruct-q4_k_m.gguf
 models/en_GB-northern_english_male-medium.onnx
